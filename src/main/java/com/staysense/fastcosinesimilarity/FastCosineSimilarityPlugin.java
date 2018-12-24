@@ -46,171 +46,199 @@ public final class FastCosineSimilarityPlugin extends Plugin implements ScriptPl
         return new FastCosineSimilarityEngine();
     }
 
-  private static class FastCosineSimilarityEngine implements ScriptEngine {
+    private static class FastCosineSimilarityEngine implements ScriptEngine {
 
-    //
-    //The normalized vector score from the query
-    //
-    double queryVectorNorm;
+	/**
+	 * The normalized vector score from the query
+	 */
+	
+	double queryVectorNorm;
 
-    @Override
-    public String getType() {
-        return "fast_cosine";
-    }
+	@Override
+	public String getType() {
+	    return "fast_cosine";
+	}
 
-    @Override
-    public <T> T compile(String scriptName, String scriptSource, ScriptContext<T> context, Map<String, String> params) {
-        if (context.equals(ScoreScript.CONTEXT) == false) {
-            throw new IllegalArgumentException(getType() + " scripts cannot be used for context [" + context.name + "]");
-        }
-        // we use the script "source" as the script identifier
-        if ("staysense".equals(scriptSource)) {
-            ScoreScript.Factory factory = (p, lookup) -> new ScoreScript.LeafFactory() {
-                // The field to compare against
-                final String field;
-                //Whether this search should be cosine or dot product
-                final Boolean cosine;
-                //The query embedded vector
-                final Object vector;
-                Boolean exclude;
-                //The final comma delimited vector representation of the query vector
-                double[] inputVector;
-                {
-                    if (p.containsKey("field") == false) {
-                        throw new IllegalArgumentException("Missing parameter [field]");
-                    }
+	@Override
+	public <T> T compile(String scriptName, String scriptSource, ScriptContext<T> context, Map<String, String> params) {
+	    if (context.equals(ScoreScript.CONTEXT) == false) {
+		throw new IllegalArgumentException(getType() + " scripts cannot be used for context [" + context.name + "]");
+	    }
+	    // we use the script "source" as the script identifier
+	    if ("staysense".equals(scriptSource)) {
+		ScoreScript.Factory factory = (p, lookup) -> new ScoreScript.LeafFactory() {
+		    // The field to compare against
+		    final String field;
+		    //Whether this search should be cosine or dot product
+		    final Boolean cosine;
+		    //The query embedded vector
+		    final Object vector;
+		    Boolean exclude;
+		    //The final comma delimited vector representation of the query vector
+		    double[] inputVector;
+		    {
+			if (p.containsKey("field") == false) {
+			    throw new IllegalArgumentException("Missing parameter [field]");
+			}
 
-                    //Determine if cosine
-                    final Object cosineBool = p.get("cosine");
-                    cosine = cosineBool != null ? (boolean)cosineBool : true;
+			//Determine if cosine
+			final Object cosineBool = p.get("cosine");
+			cosine = cosineBool != null ? (boolean)cosineBool : true;
 
-                    //Get the field value from the query
-                    field = p.get("field").toString();
+			//Get the field value from the query
+			field = p.get("field").toString();
 
-                    final Object excludeBool = p.get("exclude");
-                    exclude = excludeBool != null ? (boolean)cosineBool : true;
+			final Object excludeBool = p.get("exclude");
+			exclude = excludeBool != null ? (boolean)cosineBool : true;
 
-                    //Get the query vector embedding
-                    vector = p.get("vector");
+			//Get the query vector embedding
+			vector = p.get("vector");
 
-                    //Determine if raw comma-delimited vector or embedding was passed
-                    if(vector != null) {
-                        final ArrayList<Double> tmp = (ArrayList<Double>) vector;
-                        inputVector = new double[tmp.size()];
-                        for (int i = 0; i < inputVector.length; i++) {
-                            inputVector[i] = tmp.get(i);
-                        }
-                    } else {
-                        final Object encodedVector = p.get("encoded_vector");
-                        if(encodedVector == null) {
-                            throw new IllegalArgumentException("Must have 'vector' or 'encoded_vector' as a parameter");
-                        }
-                        inputVector = Util.convertBase64ToArray((String) encodedVector);
-                    }
+			//Determine if raw comma-delimited vector or embedding was passed
+			if(vector != null) {
+			    final ArrayList<Object> tmp = (ArrayList<Object>) vector;
+			    inputVector = new double[tmp.size()];
+			    for (int i = 0; i < inputVector.length; i++) {
+				Object obj = tmp.get(i);
+				if (obj instanceof Double) {
+				    inputVector[i] = ((Double)obj).doubleValue();
+				} else if (obj instanceof Integer) {
+				    inputVector[i] = ((Integer)obj).doubleValue();
+				} else {
+				    throw new IllegalArgumentException("Cannot convert vector to double array");
+				}
+			    }
+			} else {
+			    final Object encodedVector = p.get("encoded_vector");
+			    if(encodedVector == null) {
+				throw new IllegalArgumentException("Must have 'vector' or 'encoded_vector' as a parameter");
+			    }
+			    inputVector = Util.convertBase64ToArray((String) encodedVector);
+			}
 
-                    //If cosine calculate the query vec norm
-                    if(cosine) {
-                        queryVectorNorm = 0d;
-                        // compute query inputVector norm once
-                        for (double v : inputVector) {
-                            queryVectorNorm += Math.pow(v, 2.0);
-                        }
-                    }
-                }
+			// If cosine calculate the query vec norm
+			if (cosine) {
+			    queryVectorNorm = 0d;
+			    // compute query inputVector norm once
+			    for (double v : inputVector) {
+				queryVectorNorm += v * v;
+			    }
+			    queryVectorNorm = Math.sqrt(queryVectorNorm);
+			}
+		    }
 
-                @Override
-                public ScoreScript newInstance(LeafReaderContext context) throws IOException {
+		    @Override
+		    public ScoreScript newInstance(LeafReaderContext context) throws IOException {
+			BinaryDocValues accessor = context.reader().getBinaryDocValues(field);
+			if (accessor == null) {
+			    /*
+			     * the field and/or term don't exist in this segment,
+			     * so always return 0
+			     */
+			    return new ScoreScript(p, lookup, context) {
+				@Override
+				public double execute() {
+				    return 0.0d;
+				}
+			    };
+			}
+			return new ScoreScript(p, lookup, context) {
+			    int currentDocID = -1;
+			    // Use Lucene LeafReadContext to access binary values directly.
+			    
+			    @Override
+			    public void setDocument(int docID) {
+				/*
+				 * advance has undefined behavior calling with
+				 * a docid <= its current docid
+				 */
+				if (accessor.docID() < docID) {
+				    try {
+					accessor.advance(docID);
+				    } catch (IOException e) {
+					throw new UncheckedIOException(e);
+				    }
+				}
+				currentDocID = docID;
+			    }
 
-                    return new ScoreScript(p, lookup, context) {
-                          Boolean is_value = false;
+			    @Override
+			    public double execute() {
+				if (currentDocID != accessor.docID()) {
+				    /*
+				     * advance moved past the current doc, so this doc
+				     * has no occurrences of the term
+				     */
+				    return 0.0d;
+				}
+				
+				
+				final int inputVectorSize = inputVector.length;
+				final byte[] bytes;
 
-                          // Use Lucene LeafReadContext to access binary values directly.
-                          BinaryDocValues accessor = context.reader().getBinaryDocValues(field);
-
-                          @Override
-                          public void setDocument(int docId) {
-                              // advance has undefined behavior calling with a docid <= its current docid
-                              try {
-                                  accessor.advanceExact(docId);
-                                  is_value = true;
-                              } catch (IOException e) {
-                                  is_value = false;
-                              }
-                          }
-
-                          @Override
-                          public double execute() {
-
-                            //If there is no field value return 0 rather than fail.
-                            if (!is_value) return 0.0d;
-
-                            final int inputVectorSize = inputVector.length;
-                            final byte[] bytes;
-
-                            try {
-                                 bytes = accessor.binaryValue().bytes;
-                            } catch (IOException e) {
-                                 return 0d;
-                            }
+				try {
+				    bytes = accessor.binaryValue().bytes;
+				} catch (IOException e) {
+				    return 0d;
+				}
 
 
-                            final ByteArrayDataInput docVector = new ByteArrayDataInput(bytes);
+				final ByteArrayDataInput docVectorByteArray = new ByteArrayDataInput(bytes);
 
-                            docVector.readVInt();
+				docVectorByteArray.readVInt();
 
-                            final int docVectorLength = docVector.readVInt(); // returns the number of bytes to read
+				final int docVectorLength = docVectorByteArray.readVInt(); // returns the number of bytes to read
 
-                            if(docVectorLength != inputVectorSize * 8) {
-                                return 0d;
-                            }
+				if (docVectorLength != inputVectorSize * 8) {
+				    return 0d;
+				}
 
-                            final int position = docVector.getPosition();
+				final int position = docVectorByteArray.getPosition();
 
-                            final DoubleBuffer doubleBuffer = ByteBuffer.wrap(bytes, position, docVectorLength).asDoubleBuffer();
+				final DoubleBuffer doubleBuffer = ByteBuffer.wrap(bytes, position, docVectorLength).asDoubleBuffer();
 
-                            final double[] docVector = new double[inputVectorSize];
-                            doubleBuffer.get(docVector);
+				final double[] docVector = new double[inputVectorSize];
+				doubleBuffer.get(docVector);
 
-                            double docVectorNorm = 0d;
-                            double score = 0d;
+				double docVectorNorm = 0d;
+				double score = 0d;
 
-                            //calculate dot product of document vector and query vector
-                            for (int i = 0; i < inputVectorSize; i++) {
+				// calculate dot product of document vector and query vector
+				for (int i = 0; i < inputVectorSize; i++) {
           
-                                score += docVector[i] * inputVector[i];
+				    score += docVector[i] * inputVector[i];
 
-                                if(cosine)
-                                {
-                                  docVectorNorm += Math.pow(docVector[i], 2.0);
-                                }
-                            }
+				    if (cosine) {
+					docVectorNorm += docVector[i] * docVector[i];
+				    }
+				}
 
-                            //If cosine, calcluate cosine score
-                            if(cosine) {
+				// If cosine, calcluate cosine score
+				if (cosine) {
+					
+				    if (docVectorNorm == 0 || queryVectorNorm == 0) return 0d;
 
-                                if (docVectorNorm == 0 || queryVectorNorm == 0) return 0d;
+				    score =  score / (Math.sqrt(docVectorNorm) * Math.sqrt(queryVectorNorm));
+				}
 
-                                score =  score / (Math.sqrt(docVectorNorm) * Math.sqrt(queryVectorNorm));
-                            }
+				return score;
+			    }
+			};
+		    }
 
-                            return score;
-                          }
-                    };
-                }
+		    @Override
+		    public boolean needs_score() {
+			return false;
+		    }
+		};
+		return context.factoryClazz.cast(factory);
+	    }
+	    throw new IllegalArgumentException("Unknown script name " + scriptSource);
+	}
 
-                @Override
-                public boolean needs_score() {
-                    return false;
-                }
-            };
-            return context.factoryClazz.cast(factory);
-        }
-        throw new IllegalArgumentException("Unknown script name " + scriptSource);
+	@Override
+	public void close() {
+	    // optionally close resources
+	}
     }
-
-    @Override
-    public void close() {
-        // optionally close resources
-    }
-  }
 }
